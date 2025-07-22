@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import warnings
+from time import perf_counter
 from datetime import datetime
 
 warnings.filterwarnings('ignore')
@@ -12,12 +13,20 @@ import random
 
 import torch
 import torch.distributed as dist
+from torch.cuda import set_device
 from PIL import Image
+
+try:
+    import torch_musa
+    from torch_musa.core.device import set_device
+except ModuleNotFoundError:
+    pass
 
 import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
+from wan.utils.platform import get_torch_distributed_backend
 
 
 EXAMPLE_PROMPT = {
@@ -275,9 +284,9 @@ def generate(args):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
-        torch.cuda.set_device(local_rank)
+        set_device(local_rank)
         dist.init_process_group(
-            backend="nccl",
+            backend=get_torch_distributed_backend(),
             init_method="env://",
             rank=rank,
             world_size=world_size)
@@ -357,6 +366,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
+        start_time = perf_counter()
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -367,6 +377,8 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_time = perf_counter()
+        logging.info(f"Creating WanT2V pipeline took {end_time - start_time:.2f} seconds.")
 
         logging.info(
             f"Generating {'image' if 't2i' in args.task else 'video'} ...")
@@ -380,7 +392,6 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-
     elif "i2v" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -414,6 +425,7 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanI2V pipeline.")
+        start_time = perf_counter()
         wan_i2v = wan.WanI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -424,6 +436,8 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
+        end_time = perf_counter()
+        logging.info(f"Creating WanI2V pipeline took {end_time - start_time:.2f} seconds.")
 
         logging.info("Generating video ...")
         video = wan_i2v.generate(
@@ -572,6 +586,7 @@ def generate(args):
                 value_range=(-1, 1))
         else:
             logging.info(f"Saving generated video to {args.save_file}")
+            start_time = perf_counter()
             cache_video(
                 tensor=video[None],
                 save_file=args.save_file,
@@ -579,6 +594,8 @@ def generate(args):
                 nrow=1,
                 normalize=True,
                 value_range=(-1, 1))
+            end_time = perf_counter()
+            logging.info(f"Saving Video took {end_time - start_time:.2f} seconds")
     logging.info("Finished.")
 
 

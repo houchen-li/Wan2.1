@@ -6,11 +6,19 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.cuda.amp as amp
 import torchvision.transforms as T
 
 from .attention import flash_attention
 from .tokenizers import HuggingfaceTokenizer
 from .xlm_roberta import XLMRoberta
+
+try:
+    import torch_musa
+    import torch_musa.core.amp as amp
+    from .attention import attention as flash_attention
+except ModuleNotFoundError:
+    pass
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -29,7 +37,7 @@ def pos_interpolate(pos, seq_len):
         return torch.cat([
             pos[:, :n],
             F.interpolate(
-                pos[:, n:].float().reshape(1, src_grid, src_grid, -1).permute(
+                pos[:, n:].reshape(1, src_grid, src_grid, -1).permute(
                     0, 3, 1, 2),
                 size=(tar_grid, tar_grid),
                 mode='bicubic',
@@ -42,12 +50,6 @@ class QuickGELU(nn.Module):
 
     def forward(self, x):
         return x * torch.sigmoid(1.702 * x)
-
-
-class LayerNorm(nn.LayerNorm):
-
-    def forward(self, x):
-        return super().forward(x.float()).type_as(x)
 
 
 class SelfAttention(nn.Module):
@@ -82,7 +84,7 @@ class SelfAttention(nn.Module):
 
         # compute attention
         p = self.attn_dropout if self.training else 0.0
-        x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
+        x = flash_attention(q, k, v, dropout_p=p, causal=self.causal)
         x = x.reshape(b, s, c)
 
         # output
@@ -131,10 +133,10 @@ class AttentionBlock(nn.Module):
         self.norm_eps = norm_eps
 
         # layers
-        self.norm1 = LayerNorm(dim, eps=norm_eps)
+        self.norm1 = nn.LayerNorm(dim, eps=norm_eps)
         self.attn = SelfAttention(dim, num_heads, causal, attn_dropout,
                                   proj_dropout)
-        self.norm2 = LayerNorm(dim, eps=norm_eps)
+        self.norm2 = nn.LayerNorm(dim, eps=norm_eps)
         if activation == 'swi_glu':
             self.mlp = SwiGLU(dim, int(dim * mlp_ratio))
         else:
@@ -173,11 +175,11 @@ class AttentionPool(nn.Module):
 
         # layers
         gain = 1.0 / math.sqrt(dim)
-        self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim))
+        self.cls_embedding = gain * torch.randn(1, 1, dim, dtype=torch.float32, device="cpu")
         self.to_q = nn.Linear(dim, dim)
         self.to_kv = nn.Linear(dim, dim * 2)
         self.proj = nn.Linear(dim, dim)
-        self.norm = LayerNorm(dim, eps=norm_eps)
+        self.norm = nn.LayerNorm(dim, eps=norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
             QuickGELU() if activation == 'quick_gelu' else nn.GELU(),
@@ -187,6 +189,10 @@ class AttentionPool(nn.Module):
         """
         x:  [B, L, C].
         """
+        if self.cls_embedding.dtype != x.dtype or self.cls_embedding.device != x.device:
+            self.cls_embedding = nn.Parameter(
+                self.cls_embedding.to(dtype=x.dtype, device=x.device)
+            )
         b, s, c, n, d = *x.size(), self.num_heads, self.head_dim
 
         # compute query, key, value
@@ -252,24 +258,35 @@ class VisionTransformer(nn.Module):
             stride=patch_size,
             bias=not pre_norm)
         if pool_type in ('token', 'token_fc'):
-            self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim))
-        self.pos_embedding = nn.Parameter(gain * torch.randn(
-            1, self.num_patches +
-            (1 if pool_type in ('token', 'token_fc') else 0), dim))
+            self.cls_embedding = nn.Parameter(
+                gain * torch.randn(1, 1, dim, dtype=torch.float32, device="cpu")
+            )
+        self.pos_embedding = nn.Parameter(
+            gain
+            * torch.randn(
+                1,
+                self.num_patches + (1 if pool_type in ("token", "token_fc") else 0),
+                dim,
+                dtype=torch.float32,
+                device="cpu",
+            )
+        )
         self.dropout = nn.Dropout(embedding_dropout)
 
         # transformer
-        self.pre_norm = LayerNorm(dim, eps=norm_eps) if pre_norm else None
+        self.pre_norm = nn.LayerNorm(dim, eps=norm_eps) if pre_norm else None
         self.transformer = nn.Sequential(*[
             AttentionBlock(dim, mlp_ratio, num_heads, post_norm, False,
                            activation, attn_dropout, proj_dropout, norm_eps)
             for _ in range(num_layers)
         ])
-        self.post_norm = LayerNorm(dim, eps=norm_eps)
+        self.post_norm = nn.LayerNorm(dim, eps=norm_eps)
 
         # head
         if pool_type == 'token':
-            self.head = nn.Parameter(gain * torch.randn(dim, out_dim))
+            self.head = nn.Parameter(
+                gain * torch.randn(dim, out_dim, dtype=torch.float32, device="cpu")
+            )
         elif pool_type == 'token_fc':
             self.head = nn.Linear(dim, out_dim)
         elif pool_type == 'attn_pool':
@@ -277,6 +294,17 @@ class VisionTransformer(nn.Module):
                                       proj_dropout, norm_eps)
 
     def forward(self, x, interpolation=False, use_31_block=False):
+        if self.pool_type in ("token", "token_fc") and (
+            self.cls_embedding.dtype != x.dtype or self.cls_embedding.device != x.device
+        ):
+            self.cls_embedding = nn.Parameter(self.cls_embedding.to(dtype=x.dtype, device=x.device))
+        if self.pos_embedding.dtype != x.dtype or self.pos_embedding.device != x.device:
+            self.pos_embedding = nn.Parameter(self.pos_embedding.to(dtype=x.dtype, device=x.device))
+        if self.pool_type == "token" and (
+            self.head.dtype != x.dtype or self.head.device != x.device
+        ):
+            self.head = nn.Parameter(self.head.to(dtype=x.dtype, device=x.device))
+
         b = x.size(0)
 
         # embeddings
@@ -537,6 +565,6 @@ class CLIPModel:
         videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
 
         # forward
-        with torch.cuda.amp.autocast(dtype=self.dtype):
+        with amp.autocast(dtype=self.dtype):
             out = self.model.visual(videos, use_31_block=True)
             return out

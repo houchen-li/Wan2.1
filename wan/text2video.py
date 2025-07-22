@@ -6,13 +6,23 @@ import os
 import random
 import sys
 import types
+from time import perf_counter
 from contextlib import contextmanager
 from functools import partial
 
 import torch
 import torch.cuda.amp as amp
+from torch.cuda import empty_cache, synchronize
 import torch.distributed as dist
 from tqdm import tqdm
+
+try:
+    import torch_musa
+    import torch_musa.core.amp as amp
+    from torch_musa.core.memory import empty_cache
+    from torch_musa.core.device import synchronize
+except ModuleNotFoundError:
+    pass
 
 from .distributed.fsdp import shard_model
 from .modules.model import WanModel
@@ -24,7 +34,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
+from .utils.platform import get_device
 
 class WanT2V:
 
@@ -60,7 +70,7 @@ class WanT2V:
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = get_device(device_id)
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -72,7 +82,7 @@ class WanT2V:
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device('cpu'),
+            device=self.device,
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
             shard_fn=shard_fn if t5_fsdp else None)
@@ -102,8 +112,8 @@ class WanT2V:
         else:
             self.sp_size = 1
 
-        if dist.is_initialized():
-            dist.barrier()
+        # if dist.is_initialized():
+        #     dist.barrier()
         if dit_fsdp:
             self.model = shard_fn(self.model)
         else:
@@ -171,6 +181,7 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
+        start_time = perf_counter()
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -182,6 +193,8 @@ class WanT2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
+        end_time = perf_counter()
+        logging.info(f"T5 Encoding Context took {end_time - start_time:.2f} seconds.")
 
         noise = [
             torch.randn(
@@ -189,7 +202,7 @@ class WanT2V:
                 target_shape[1],
                 target_shape[2],
                 target_shape[3],
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device=self.device,
                 generator=seed_g)
         ]
@@ -230,13 +243,14 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
+            start_time = perf_counter()
+            self.model.to(self.device)
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
@@ -252,20 +266,25 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+            end_time = perf_counter()
+            logging.info(f"Sampling took {end_time - start_time:.2f} seconds.")
 
             x0 = latents
             if offload_model:
                 self.model.cpu()
-                torch.cuda.empty_cache()
+                empty_cache()
             if self.rank == 0:
+                start_time = perf_counter()
                 videos = self.vae.decode(x0)
+                end_time = perf_counter()
+                logging.info(f"VAE Decoding took {end_time - start_time:.2f} seconds.")
 
         del noise, latents
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
+            synchronize()
+        # if dist.is_initialized():
+        #     dist.barrier()
 
         return videos[0] if self.rank == 0 else None

@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import warnings
+
 import torch
 
 try:
@@ -13,7 +15,13 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
-import warnings
+try:
+    import torch_musa
+    FLASH_ATTN_3_AVAILABLE = False
+    FLASH_ATTN_2_AVAILABLE = False
+except ModuleNotFoundError:
+    pass
+
 
 __all__ = [
     'flash_attention',
@@ -51,7 +59,7 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert (q.device.type == "cuda" or q.device.type == "musa") and q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -172,8 +180,9 @@ def attention(
         k = k.transpose(1, 2).to(dtype)
         v = v.transpose(1, 2).to(dtype)
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False):
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=causal, scale=softmax_scale)
 
         out = out.transpose(1, 2).contiguous()
         return out

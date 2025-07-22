@@ -19,7 +19,6 @@ def rand_name(length=8, suffix=''):
         name += suffix
     return name
 
-
 def cache_video(tensor,
                 save_file=None,
                 fps=30,
